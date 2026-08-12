@@ -17,6 +17,10 @@ func Execute() error {
 	fs.SetOutput(io.Discard)
 
 	if err := fs.Parse(os.Args[1:]); err != nil {
+		if err == flag.ErrHelp {
+			printUsage(os.Stdout)
+			return nil
+		}
 		return err
 	}
 
