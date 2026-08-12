@@ -1,5 +1,4 @@
 // Package cmd 提供命令行入口与子命令分发。
-// 子命令遵循 <资源> <动作> 的命名方式，例如 `users list`、`users create`。
 package cmd
 
 import (
@@ -33,10 +32,14 @@ func Execute() error {
 		return nil
 	case "login":
 		return runLogin(args[1:])
-	case "me":
-		return runMe(args[1:])
-	case "users":
-		return runUsers(args[1:])
+	case "logout":
+		return runLogout(args[1:])
+	case "whoami":
+		return runCall(append([]string{"auth.info"}, args[1:]...))
+	case "call":
+		return runCall(args[1:])
+	case "list":
+		return runList(args[1:])
 	case "help", "-h", "--help":
 		printUsage(os.Stdout)
 		return nil
@@ -53,18 +56,16 @@ func printUsage(w io.Writer) {
   laravel-skel-cli <子命令> [参数]
 
 认证:
-  login       登录并保存 token
-  me          获取当前登录用户信息
+  login --account <账号> --password <密码> [--base-url <地址>]   登录并保存 token
+  logout                                                       退出并清除 token
+  whoami                                                       获取当前登录管理员信息
 
-资源:
-  users list         查询用户列表
-  users create       创建用户
+接口调用（数据驱动，见 list）:
+  call <slug> [--参数 值]   调用指定接口并输出 JSON
+  list                      列出全部可调用接口
 
 其他:
   version     显示版本号
   help        显示帮助信息
-
-提示: 可在配置文件 (~/.config/laravel-skel-cli/config.json)
-      中设置 base_url，或通过 login 命令获取。
 `)
 }

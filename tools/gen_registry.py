@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""从 Apifox 导出的 OpenAPI 3.0 规范生成 Go 接口注册表 (internal/apidefs/registry.go)。
+
+用法:
+    python3 tools/gen_registry.py /tmp/apifox_openapi.json
+
+生成的 registry.go 由 cmd/call.go 的通用 runner 消费，实现"数据驱动"的命令执行，
+新增/更新接口时只需重新导出 OpenAPI 并重新运行本脚本即可。
+"""
+import json
+import sys
+import re
+
+
+def literal_segs(path):
+    return [s for s in path.split("/") if s and s != "admin" and not s.startswith("{")]
+
+
+def has_path_param(path):
+    return any(s.startswith("{") for s in path.split("/") if s)
+
+
+def build_slug(path, method):
+    literals = literal_segs(path)
+    hp = has_path_param(path)
+    verb = {
+        ("get", False): "list", ("get", True): "show",
+        ("post", False): "create", ("post", True): "create",
+        ("put", True): "update", ("delete", True): "delete",
+    }.get((method, hp))
+    if len(literals) == 1:
+        # 单资源：集合(list/create) 或 详情(show/update/delete)
+        return f"{literals[0]}.{verb}"
+    # 多段路径：直接使用路径，动作型接口不带 verb
+    return ".".join(literals)
+
+
+def map_type(schema):
+    t = schema.get("type")
+    if t == "array":
+        return "array"
+    if t == "integer":
+        return "integer"
+    if t == "number":
+        return "number"
+    if t == "boolean":
+        return "boolean"
+    return "string"
+
+
+def extract_params(parameters):
+    """提取 path/query 参数，忽略 header 等无关参数。"""
+    params = []
+    for p in parameters:
+        loc = p.get("in")
+        if loc not in ("path", "query"):
+            continue
+        params.append({
+            "name": p["name"],
+            "in": loc,
+            "type": map_type((p.get("schema") or {})),
+            "required": bool(p.get("required")),
+            "description": (p.get("description") or "").strip(),
+        })
+    return params
+
+
+def extract_body(request_body, components):
+    """提取 JSON 请求体字段；支持 $ref 解析，非对象请求体降级为 body 原始参数。"""
+    if not request_body:
+        return []
+    schema = (request_body.get("content") or {}).get("application/json", {}).get("schema") or {}
+    schema = resolve_ref(schema, components)
+    t = schema.get("type")
+    if t != "object":
+        # 原始请求体（如通知已读的 JSON 数组字符串），以 body 参数承载
+        return [{
+            "name": "body",
+            "in": "body",
+            "type": map_type(schema),
+            "required": bool(request_body.get("required", True)),
+            "description": "原始请求体（JSON）",
+        }]
+    props = schema.get("properties") or {}
+    required = set(schema.get("required") or [])
+    params = []
+    for name, prop in props.items():
+        prop = resolve_ref(prop, components)
+        params.append({
+            "name": name,
+            "in": "body",
+            "type": map_type(prop),
+            "required": name in required,
+            "description": (prop.get("description") or prop.get("title") or "").strip(),
+        })
+    return params
+
+
+def resolve_ref(schema, components):
+    """解析顶层 $ref 引用。"""
+    if isinstance(schema, dict) and "$ref" in schema:
+        name = schema["$ref"].rsplit("/", 1)[-1]
+        return (components or {}).get("schemas", {}).get(name, schema)
+    return schema
+
+
+def go_str(s):
+    return json.dumps(s, ensure_ascii=False)
+
+
+def go_literal(params):
+    if not params:
+        return "nil"
+    lines = []
+    for p in params:
+        lines.append(
+            "{Name: %s, In: %s, Type: %s, Required: %s, Description: %s},"
+            % (go_str(p["name"]), go_str(p["in"]), go_str(p["type"]),
+               str(p["required"]).lower(), go_str(p["description"]))
+        )
+    return "[]Param{\n" + "\n".join("        " + l for l in lines) + "\n    }"
+
+
+def main():
+    if len(sys.argv) < 2:
+        print("用法: python3 tools/gen_registry.py <openapi.json>", file=sys.stderr)
+        sys.exit(1)
+
+    spec = json.load(open(sys.argv[1]))
+    paths = spec.get("paths") or {}
+
+    endpoints = []
+    for path in sorted(paths):
+        for method in ("get", "post", "put", "delete", "patch"):
+            op = paths[path].get(method)
+            if not op:
+                continue
+            endpoints.append({
+                "method": method.upper(),
+                "path": path,
+                "summary": op.get("summary") or "",
+                "path_params": [p for p in extract_params(op.get("parameters") or []) if p["in"] == "path"],
+                "query_params": [p for p in extract_params(op.get("parameters") or []) if p["in"] == "query"],
+                "body_params": extract_body(op.get("requestBody"), spec.get("components")),
+            })
+
+    # 生成 slug 并保证唯一性
+    used = {}
+    for ep in endpoints:
+        slug = build_slug(ep["path"], ep["method"].lower())
+        base = slug
+        n = 1
+        while slug in used and used[slug] != (ep["path"], ep["method"]):
+            slug = f"{base}-{ep['method'].lower()}"
+            n += 1
+            if n > 3:
+                slug = f"{base}-{ep['method'].lower()}-{len(endpoints)}"
+        used[slug] = (ep["path"], ep["method"])
+        ep["slug"] = slug
+
+    lines = []
+    lines.append("// Code generated by tools/gen_registry.py; DO NOT EDIT.")
+    lines.append("// 来源: Apifox 项目导出的 OpenAPI 3.0 规范。")
+    lines.append("package apidefs")
+    lines.append("")
+    lines.append("var Endpoints = []Endpoint{")
+    for ep in endpoints:
+        lines.append("\t{")
+        lines.append(f"\t\tSlug: {go_str(ep['slug'])},")
+        lines.append(f"\t\tMethod: {go_str(ep['method'])},")
+        lines.append(f"\t\tPath: {go_str(ep['path'])},")
+        lines.append(f"\t\tSummary: {go_str(ep['summary'])},")
+        lines.append(f"\t\tPathParams: {go_literal(ep['path_params'])},")
+        lines.append(f"\t\tQueryParams: {go_literal(ep['query_params'])},")
+        lines.append(f"\t\tBodyParams: {go_literal(ep['body_params'])},")
+        lines.append("\t},")
+    lines.append("}")
+    lines.append("")
+
+    out = sys.argv[2] if len(sys.argv) > 2 else "internal/apidefs/registry.go"
+    with open(out, "w") as f:
+        f.write("\n".join(lines))
+
+    # 打印摘要用于核对
+    print(f"生成 {len(endpoints)} 个接口 -> {out}")
+    slugs = [ep["slug"] for ep in endpoints]
+    dup = [s for s in set(slugs) if slugs.count(s) > 1]
+    print("重复 slug:", dup if dup else "无")
+    for ep in endpoints:
+        print(f"  {ep['slug']:<32} {ep['method']:<6} {ep['path']}")
+
+
+if __name__ == "__main__":
+    main()
