@@ -34,6 +34,8 @@ func Execute() error {
 		return runLogin(args[1:])
 	case "logout":
 		return runLogout(args[1:])
+	case "config":
+		return runConfig(args[1:])
 	case "whoami":
 		return runCall(append([]string{"auth.info"}, args[1:]...))
 	case "call":
@@ -59,6 +61,9 @@ func printUsage(w io.Writer) {
   login --account <账号> --password <密码> [--base-url <地址>]   登录并保存 token
   logout                                                       退出并清除 token
   whoami                                                       获取当前登录管理员信息
+  config set-base-url <地址>   设置后端 API 地址到配置
+  config set-token <token>     设置 token 到配置
+  config get                  查看当前配置
 
 接口调用（数据驱动，见 list）:
   call <slug> [--参数 值]   调用指定接口并输出 JSON
